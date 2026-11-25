@@ -100,20 +100,21 @@ impl ExplicitEnv for Env {
             "OHOS_BASE_SDK_HOME".into(),
             self.ohos_home.as_os_str().to_os_string(),
         );
-        // seems like only Linux requires this, but let's see
-        // OHOS_HOME is /path/to/sdk/default/openharmony/18, we want /path/to/sdk for DEVECO_SDK_HOME
-        envs.insert(
-            "DEVECO_SDK_HOME".into(),
-            self.ohos_home
-                .parent()
-                .unwrap()
-                .parent()
-                .unwrap()
-                .parent()
-                .unwrap()
+        // OHOS_HOME can be `/path/to/sdk/default/openharmony` (DevEco Studio 5/6)
+        // or `/path/to/sdk/default/openharmony/<api>`. Resolve DEVECO_SDK_HOME to `/path/to/sdk`
+        // unless already explicitly set.
+        let deveco_sdk_home = std::env::var_os("DEVECO_SDK_HOME").unwrap_or_else(|| {
+            let candidate = if self.ohos_home.file_name().and_then(|n| n.to_str()) == Some("openharmony") {
+                self.ohos_home.parent().and_then(|p| p.parent())
+            } else {
+                self.ohos_home.parent().and_then(|p| p.parent()).and_then(|p| p.parent())
+            };
+            candidate
+                .unwrap_or(&self.ohos_home)
                 .as_os_str()
-                .to_os_string(),
-        );
+                .to_os_string()
+        });
+        envs.insert("DEVECO_SDK_HOME".into(), deveco_sdk_home);
         envs
     }
 }

@@ -111,7 +111,7 @@ impl<'a> TargetTrait<'a> for Target<'a> {
             targets.insert(
                 "armv7",
                 Target {
-                    triple: "aarch64-unknown-linux-ohos",
+                    triple: "armv7-unknown-linux-ohos",
                     abi: "armeabi-v7a",
                     arch: "arm",
                 },
