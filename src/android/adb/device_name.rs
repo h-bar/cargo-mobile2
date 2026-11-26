@@ -6,6 +6,7 @@ use std::{
 
 use super::adb;
 use crate::regex;
+use crate::DuctExpressionExt as _;
 use crate::{
     android::env::Env,
     util::cli::{Report, Reportable},
@@ -48,13 +49,16 @@ impl Reportable for Error {
 
 pub fn device_name(env: &Env, serial_no: &str) -> Result<String, Error> {
     if serial_no.starts_with("emulator") {
+        // Under Node.js (napi) the inherited stdin is close-on-exec, so adb would start with fd 0
+        // closed and fail to reach its server; give it /dev/null instead.
         let cmd = adb(env, ["-s", serial_no, "emu", "avd", "name"])
+            .stdin_null()
             .stderr_capture()
             .stdout_capture();
         let name = super::check_authorized(
             cmd.start()
                 .map_err(|error| Error::CommandFailed {
-                    command: format!("{cmd:?}"),
+                    command: cmd.display_cmd(),
                     error,
                 })?
                 .wait_timeout(Duration::from_secs(3))
@@ -65,7 +69,7 @@ pub fn device_name(env: &Env, serial_no: &str) -> Result<String, Error> {
                     ))
                 })
                 .map_err(|error| Error::CommandFailed {
-                    command: format!("{cmd:?}"),
+                    command: cmd.display_cmd(),
                     error,
                 })?,
         )
@@ -90,12 +94,13 @@ pub fn device_name(env: &Env, serial_no: &str) -> Result<String, Error> {
             env,
             ["-s", serial_no, "shell", "dumpsys", "bluetooth_manager"],
         )
+        .stdin_null()
         .stderr_capture()
         .stdout_capture();
         super::check_authorized(
             cmd.start()
                 .map_err(|error| Error::CommandFailed {
-                    command: format!("{cmd:?}"),
+                    command: cmd.display_cmd(),
                     error,
                 })?
                 .wait_timeout(Duration::from_secs(3))
@@ -106,7 +111,7 @@ pub fn device_name(env: &Env, serial_no: &str) -> Result<String, Error> {
                     ))
                 })
                 .map_err(|error| Error::CommandFailed {
-                    command: format!("{cmd:?}"),
+                    command: cmd.display_cmd(),
                     error,
                 })?,
         )

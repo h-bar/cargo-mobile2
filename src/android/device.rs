@@ -12,6 +12,7 @@ use crate::{
     DuctExpressionExt,
 };
 use std::{
+    ffi::OsStr,
     fmt::{self, Display},
     path::PathBuf,
     thread::sleep,
@@ -126,6 +127,9 @@ pub enum ConnectionStatus {
     Authorizing,
 }
 
+/// How many times to poll for the app's PID (about 2 s apart) before starting logcat without it.
+const PID_POLL_ATTEMPTS: u32 = 5;
+
 #[derive(Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct Device<'a> {
     serial_no: String,
@@ -210,6 +214,7 @@ impl<'a> Device<'a> {
         loop {
             let cmd = self
                 .adb(env)
+                .stdin_null()
                 .stderr_capture()
                 .stdout_capture()
                 .before_spawn(move |cmd| {
@@ -256,6 +261,16 @@ impl<'a> Device<'a> {
             .reduce(last_modified)
             .unwrap();
 
+        let display_cmd = {
+            let apk_path = apk_path.clone();
+            move |cmd: &duct::Expression| {
+                cmd.display_cmd_with([
+                    OsStr::new("install"),
+                    OsStr::new("-r"),
+                    apk_path.as_os_str(),
+                ])
+            }
+        };
         let cmd = self
             .adb(env)
             .before_spawn(move |cmd| {
@@ -266,12 +281,12 @@ impl<'a> Device<'a> {
             .dup_stdio();
         cmd.start()
             .map_err(|err| ApkInstallError::InstallFailed {
-                command: format!("{cmd:?}"),
+                command: display_cmd(&cmd),
                 error: err,
             })?
             .wait()
             .map_err(|err| ApkInstallError::InstallFailed {
-                command: format!("{cmd:?}"),
+                command: display_cmd(&cmd),
                 error: err,
             })?;
 
@@ -331,22 +346,17 @@ impl<'a> Device<'a> {
             .into_iter()
             .reduce(last_modified)
             .unwrap();
-        let cmd = bundletool::command();
-        let cmd_str = format!(
-            "{cmd:?} install-apks --apks={}",
-            apks_path.to_str().unwrap()
-        );
-        let cmd = cmd.before_spawn(move |cmd| {
-            cmd.args([
-                "install-apks",
-                &format!("--apks={}", apks_path.to_str().unwrap()),
-            ]);
-
-            Ok(())
+        let apks_arg = format!("--apks={}", apks_path.to_str().unwrap());
+        let cmd = bundletool::command().before_spawn({
+            let apks_arg = apks_arg.clone();
+            move |cmd| {
+                cmd.args(["install-apks", &apks_arg]);
+                Ok(())
+            }
         });
         cmd.run()
             .map_err(|err| ApkInstallError::InstallFromAabFailed {
-                command: cmd_str,
+                command: cmd.display_cmd_with(["install-apks", apks_arg.as_str()]),
                 error: err,
             })?;
         Ok(())
@@ -388,7 +398,7 @@ impl<'a> Device<'a> {
         reinstall_deps: bool,
         activity: String,
     ) -> Result<duct::Handle, RunError> {
-        return self.run_with_application_id_suffix(
+        self.run_with_application_id_suffix(
             config,
             env,
             noise_level,
@@ -398,7 +408,7 @@ impl<'a> Device<'a> {
             reinstall_deps,
             activity,
             None,
-        );
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -448,14 +458,17 @@ impl<'a> Device<'a> {
                 Ok(())
             })
             .dup_stdio();
+        let display_cmd = |cmd: &duct::Expression| {
+            cmd.display_cmd_with(["shell", "am", "start", "-n", activity.as_str()])
+        };
         cmd.start()
             .map_err(|err| RunError::CommandFailed {
-                command: format!("{cmd:?} shell am start -n {activity}"),
+                command: display_cmd(&cmd),
                 error: err,
             })?
             .wait()
             .map_err(|err| RunError::CommandFailed {
-                command: format!("{cmd:?} shell am start -n {activity}"),
+                command: display_cmd(&cmd),
                 error: err,
             })?;
 
@@ -473,31 +486,57 @@ impl<'a> Device<'a> {
                 .logcat()
         );
 
-        let stdout = loop {
-            let cmd = duct::cmd(
-                env.platform_tools_path().join("adb"),
-                ["shell", "pidof", "-s", app_identifier.as_str()],
-            )
-            .vars(env.explicit_env())
-            .stderr_capture()
-            .stdout_capture();
+        // Wait for the app's process so logcat can be filtered by its PID. Give up after a while
+        // (e.g. the app crashed on launch) and fall back to logcat without the PID filter.
+        let mut pid = String::new();
+        for _ in 0..PID_POLL_ATTEMPTS {
+            let app_identifier_ = app_identifier.clone();
+            // Under Node.js (napi) the inherited stdin is close-on-exec, so adb would start with fd 0
+            // closed and fail to reach its server; give it /dev/null instead.
+            let cmd = self
+                .adb(env)
+                .stdin_null()
+                .stderr_capture()
+                .stdout_capture()
+                .unchecked()
+                .before_spawn(move |cmd| {
+                    cmd.args(["shell", "pidof", "-s", &app_identifier_]);
+                    Ok(())
+                });
             let handle = cmd.start().map_err(|err| RunError::CommandFailed {
-                command: format!("{cmd:?}"),
+                command: cmd.display_cmd(),
                 error: err,
             })?;
             if let Ok(out) = handle.wait() {
                 if out.status.success() {
-                    break String::from_utf8_lossy(&out.stdout).into_owned();
+                    pid = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                    break;
                 }
+                log::debug!(
+                    "`adb shell pidof -s {}` failed: {}",
+                    app_identifier,
+                    String::from_utf8_lossy(&out.stderr).trim()
+                );
             }
             sleep(Duration::from_secs(2));
-        };
-        let pid = stdout.trim().to_string();
-        let mut logcat = duct::cmd(
-            env.platform_tools_path().join("adb"),
-            ["logcat", "-v", "color", "-s", &filter],
+        }
+        if pid.is_empty() {
+            log::warn!(
+                "Could not find the process of {app_identifier}; showing logcat without a PID filter"
+            );
+        }
+        let mut logcat = adb::adb(
+            env,
+            [
+                "-s",
+                &self.serial_no,
+                "logcat",
+                "-v",
+                "color",
+                "-s",
+                &filter,
+            ],
         )
-        .vars(env.explicit_env())
         .dup_stdio();
 
         let logcat_filter_specs = config.logcat_filter_specs().to_vec();
@@ -509,7 +548,7 @@ impl<'a> Device<'a> {
             Ok(())
         });
         logcat.start().map_err(|err| RunError::CommandFailed {
-            command: format!("{logcat:?}"),
+            command: logcat.display_cmd(),
             error: err,
         })
     }
@@ -541,11 +580,11 @@ impl<'a> Device<'a> {
                 )
                 .dup_stdio();
 
-        if logcat_command
-            .pipe(&stack_command)
+        let pipeline = logcat_command.pipe(stack_command);
+        if pipeline
             .start()
             .map_err(|err| StacktraceError::CommandFailed {
-                command: format!("{logcat_command:?} | {stack_command:?}"),
+                command: pipeline.display_cmd(),
                 error: err,
             })?
             .wait()
